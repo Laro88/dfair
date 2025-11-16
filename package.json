@@ -1,18 +1,36 @@
 {
-  "name": "dfair",
-  "version": "0.0.6",
-  "description": "Danfoss Air IO driver",
-  "main": "demoapp_knownipnumber.js",
+  "name": "danfoss-air-api",
+  "version": "1.0.0",
+  "description": "TypeScript library for communicating with Danfoss Air ventilation systems over LAN",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/**/*",
+    "samples/**/*",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "debug": "node --inspect demoapp_knownipnumber.js"
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "prepare": "npm run build",
+    "test": "npm run build && node test/smoke-test.js",
+    "debug": "node --inspect samples/demoapp_knownipnumber.js"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Laro88/dfair.git"
   },
   "keywords": [
-    "Danfoss Air IO driver"
+    "danfoss",
+    "air",
+    "ventilation",
+    "hvac",
+    "iot",
+    "home-automation",
+    "typescript",
+    "nodejs"
   ],
   "author": "JERA",
   "license": "MIT",
@@ -20,7 +38,11 @@
     "url": "https://github.com/Laro88/dfair/issues"
   },
   "homepage": "https://github.com/Laro88/dfair#readme",
-  "dependencies": {
-    "mqtt": "^5.10.3"
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
