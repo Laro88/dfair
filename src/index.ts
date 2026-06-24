@@ -73,13 +73,16 @@ export class DanfossAir {
   private activeParam?: DanfossParam;
   private activePromise?: Promise<void>;
   private activePromiseResolve?: () => void;
-  private activePromiseReject?: () => void;
+  private activePromiseReject?: (error: Error) => void;
   private activeTimeout?: NodeJS.Timeout;
   private continueOnError: boolean = false;
 
   private cycle: number;
   private step: number;
   private writeBuffer: Buffer[] = [];
+  private isConnected: boolean = false;
+  private isConnecting: boolean = false;
+  private disposed: boolean = false;
 
   constructor(options: DanfossAirOptions) {
     this.ip = options.ip;
@@ -89,6 +92,9 @@ export class DanfossAir {
     this.errorCallback = options.errorCallback;
     this.dataParams = this.initDataParams();
     this.continueOnError = options.continueOnError || false;
+
+    this.socket = new net.Socket();
+    this.setupSocketEventHandlers();
 
     // Find common cycle for all intervals
     const intervals = this.dataParams.filter(param => (param.interval || options.delaySeconds) > 0).map(param => param.interval || options.delaySeconds as number);
@@ -115,69 +121,89 @@ export class DanfossAir {
     return (a * b) / this.gcd(a, b);
   }
 
-  private async setupSocket(): Promise<void> {
-    await new Promise<void>((resolve, reject) => {
-      this.socket = new net.Socket();
+  private setupSocketEventHandlers(): void {
+    if (!this.socket) return;
 
-      this.socket.on('data', (payload: Buffer) => {
-        this.log(`Data received: ${payload.toString("hex")} size: ${payload.length}`);
-        this.processIncomingData(payload);
-      });
+    this.socket.on('data', (payload: Buffer) => {
+      this.log(`Data received: ${payload.toString("hex")} size: ${payload.length}`);
+      this.processIncomingData(payload);
+    });
 
-      const connectionTimeout = setTimeout(() => reject(new Error('Connection timed out')), 5000);
-      let resolved = false;
+    this.socket.on('connect', () => {
+      this.log('Connected');
+      this.isConnected = true;
+      this.isConnecting = false;
+    });
 
-      this.socket.on('connect', () => {
-        this.log('Connected');
+    this.socket.on('end', () => {
+      this.log('Socket ended');
+      this.isConnected = false;
+      this.isConnecting = false;
+    });
+
+    this.socket.on('close', () => {
+      this.log('Socket closed');
+      this.isConnected = false;
+      this.isConnecting = false;
+    });
+
+    this.socket.on('error', (err: Error) => {
+      this.log(`Socket error: ${err}`);
+      this.isConnected = false;
+      this.isConnecting = false;
+      
+      if (this.errorCallback) {
+        this.errorCallback(err, 'connection');
+      }
+    });
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (this.isConnected || this.isConnecting) {
+      return;
+    }
+
+    this.isConnecting = true;
+
+    return new Promise<void>((resolve, reject) => {
+      if (!this.socket) {
+        this.isConnecting = false;
+        return reject(new Error('Socket not initialized'));
+      }
+
+      const connectionTimeout = setTimeout(() => {
+        this.isConnecting = false;
+        reject(new Error('Connection timed out'));
+      }, 5000);
+
+      const onConnect = () => {
         clearTimeout(connectionTimeout);
-        resolved = true;
+        this.socket?.removeListener('error', onError);
         resolve();
-      });
+      };
 
-      this.socket.on('end', (e: any) => {
-        this.log(`end: ${e}`);
-      });
-
-      this.socket.on('error', (err: Error) => {
-        this.log(`Error: ${err}`);
-
-        if (this.socket) {
-          this.socket.destroy();
-        }
-        this.activeParam = undefined;
-        this.activePromise = undefined;
-        this.activePromiseResolve = undefined;
-        this.activePromiseReject = undefined;
-
-        clearTimeout(this.activeTimeout);
+      const onError = (err: Error) => {
         clearTimeout(connectionTimeout);
-        this.activeTimeout = undefined;
+        this.socket?.removeListener('connect', onConnect);
+        this.isConnecting = false;
+        reject(err);
+      };
 
-        if (!resolved) {
-          reject(err);
-        }
-      });
-
+      this.socket.once('connect', onConnect);
+      this.socket.once('error', onError);
 
       this.socket.connect({ host: this.ip, port: 30046 });
     });
-
   }
 
   public async start(): Promise<void> {
-    await this.setupSocket();
-
+    await this.ensureConnected();
     await this.sanityCheck();
 
-    if (this.socket && !this.socket.closed && !this.socket.connecting) {
-      this.log(`Socket connected ${this.socket.remoteAddress}:${this.socket.remotePort} = ${this.socket?.closed} ${this.socket?.connecting}`);
-      this.socket.destroy();
-      this.timeout = setTimeout(() => {
-        this.refreshData();
-      }, 500);
-    } else {
-      this.log('Socket not connected');
-    }
+    this.log('Starting refresh cycle');
+    this.timeout = setTimeout(() => {
+      this.refreshData();
+    }, 500);
   }
 
   private async sanityCheck(): Promise<void> {
@@ -204,15 +230,20 @@ export class DanfossAir {
   }
 
   public cleanup(): void {
+    this.disposed = true;
     if (this.timeout) {
       clearTimeout(this.timeout);
+      this.timeout = null;
     }
-    if (this.activeTimeout) {
-      clearTimeout(this.activeTimeout);
-    }
+    // Release any in-flight read/write so a pending await does not hang forever.
+    this.settleActiveOperation(new Error('connection closed'));
     if (this.socket) {
+      this.socket.removeAllListeners();
       this.socket.destroy();
+      this.socket = null;
     }
+    this.isConnected = false;
+    this.isConnecting = false;
   }
 
   private buildParam(
@@ -514,8 +545,8 @@ export class DanfossAir {
       this.activePromiseReject = reject;
     });
     await new Promise<void>((resolve, reject) => {
-      if (!this.socket || this.socket.closed || this.socket.connecting) {
-        return reject(new Error('Socket not initialized'));
+      if (!this.socket || !this.isConnected) {
+        return reject(new Error('Socket not connected'));
       }
 
       this.socket.write(data, (error) => {
@@ -539,47 +570,57 @@ export class DanfossAir {
     }
   }
 
+  private buildSnapshot(): ParamData[] {
+    return this.dataParams.map(param => ({
+      id: param.id,
+      name: param.name,
+      unit: param.unit,
+      value: param.value
+    }));
+  }
+
+  /**
+   * Schedule the next refresh cycle exactly once, after delaySeconds.
+   * Never re-arms once the instance has been cleaned up.
+   */
+  private scheduleNext(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.timeout = setTimeout(() => {
+      this.refreshData();
+    }, this.delaySeconds * 1000);
+  }
+
   private refreshData(): void {
-    this.refreshDataAsync().then(() => {
-      this.timeout = setTimeout(() => {
-        if (this.debug) {
-          //this.debugDumpData();
-        }
-
+    this.refreshDataAsync()
+      .then(() => {
         if (this.callbackFunction) {
-          // Create a clean set of outputs
-          const data: ParamData[] = [];
-          for (const param of this.dataParams) {
-            data.push({
-              id: param.id,
-              name: param.name,
-              unit: param.unit,
-              value: param.value
-            });
-          }
-
-          this.callbackFunction(data);
-          
-          if (!this.continueOnError) {
-            this.refreshData();
-          }
+          this.callbackFunction(this.buildSnapshot());
         }
-      }, this.delaySeconds * 1000);
-    }).catch((err) => this.errorCallback && this.errorCallback(err, 'connection'))
-      .finally(() => {
+        this.scheduleNext();
+      })
+      .catch((err) => {
+        if (this.errorCallback) {
+          this.errorCallback(err, 'connection');
+        }
         if (this.continueOnError) {
-          this.refreshData();
+          this.scheduleNext();
         }
       });
   }
 
   private currentStep: number = 0;
   private async refreshDataAsync(): Promise<void> {
-    if (this.socket?.connecting) {
+    if (this.isConnecting) {
       this.log('Socket still connecting, skipping this cycle');
       return;
     }
-    await this.setupSocket();
+
+    // Ensure we're connected before proceeding
+    if (!this.isConnected) {
+      await this.ensureConnected();
+    }
 
     // Flush any pending write operations
     await this.flushWriteBuffer();
@@ -615,9 +656,6 @@ export class DanfossAir {
       }
     }
 
-    if (this.socket) {
-      this.socket.destroy();
-    }
     const millis = Date.now() - timestampBegin;
     this.log(`Refresh took: ${millis} milliseconds`);
     this.currentStep += this.delaySeconds;
@@ -636,15 +674,44 @@ export class DanfossAir {
     });
   }
 
+  /**
+   * The single place where an in-flight read/write operation is settled.
+   * Tears down the timeout, active parameter and promise handlers before
+   * resolving/rejecting so a late response can never resolve a settled op
+   * and no stale closures are retained.
+   */
+  private settleActiveOperation(error?: Error): void {
+    if (this.activeTimeout) {
+      clearTimeout(this.activeTimeout);
+      this.activeTimeout = undefined;
+    }
+    const resolve = this.activePromiseResolve;
+    const reject = this.activePromiseReject;
+    this.activePromiseResolve = undefined;
+    this.activePromiseReject = undefined;
+    this.activeParam = undefined;
+
+    if (error) {
+      if (reject) {
+        reject(error);
+      }
+    } else if (resolve) {
+      resolve();
+    }
+  }
+
   private activeOperationTimeout(): void {
     this.log('activeOperationTimeout');
-    if (this.activePromiseReject) {
-      this.activePromiseReject();
-    }
-    this.activeParam = undefined;
+    this.settleActiveOperation(new Error('operation timed out'));
   }
 
   private async operationReadValue(param: DanfossParam): Promise<void> {
+    // Validate the socket before assigning any active-operation state so the
+    // early failure path leaves nothing dangling.
+    if (!this.socket || !this.isConnected) {
+      throw new Error('Socket not connected');
+    }
+
     this.activeParam = param;
 
     this.activePromise = new Promise<void>((resolve, reject) => {
@@ -658,10 +725,12 @@ export class DanfossAir {
     buffer[1] = 4; // read
     buffer.writeUint16BE(param.address, 2);
 
-    if (!this.socket || this.socket.closed || this.socket.connecting)
-      throw new Error('Socket not initialized');
-
-    this.socket.write(new Uint8Array(buffer));
+    this.socket.write(new Uint8Array(buffer), (error) => {
+      if (error) {
+        // Surface send failures instead of waiting for the 3s timeout.
+        this.settleActiveOperation(error);
+      }
+    });
 
     this.activeTimeout = setTimeout(() => {
       this.activeOperationTimeout();
@@ -671,55 +740,67 @@ export class DanfossAir {
   }
 
   private processIncomingData(payload: Buffer): void {
-    if (this.activeParam) {
+    // An operation is in flight only while its promise is unsettled. Without
+    // one, ignore stray/late/duplicate frames so they can't resolve a settled
+    // op or be applied to the wrong parameter.
+    if (!this.activePromiseResolve && !this.activePromiseReject) {
+      this.log('Received data with no active operation, ignoring');
+      return;
+    }
+
+    // Reads decode and store a value; writes leave activeParam undefined and
+    // only need the operation settled.
+    const param = this.activeParam;
+    if (param) {
       let responseValue: number | boolean;
 
-      // Determine if the data is for the current packet
-      switch (this.activeParam.datatype) {
-        case 'byte':
-          responseValue = payload[0];
-          break;
-        case 'bool':
-          responseValue = payload[0] === 1;
-          break;
-        case 'ushort':
-          responseValue = payload.readUInt16BE();
-          break;
-        case 'uint':
-          responseValue = payload.readUInt32BE();
-          break;
-        case 'string':
-          throw new Error('string datatype not handled properly TODO');
-        default:
-          throw new Error(`unhandled datatype: ${this.activeParam.datatype}`);
+      try {
+        switch (param.datatype) {
+          case 'byte':
+            if (payload.length < 1) {
+              throw new Error('Payload too short for byte');
+            }
+            responseValue = payload[0];
+            break;
+          case 'bool':
+            if (payload.length < 1) {
+              throw new Error('Payload too short for bool');
+            }
+            responseValue = payload[0] === 1;
+            break;
+          case 'ushort':
+            responseValue = payload.readUInt16BE();
+            break;
+          case 'uint':
+            responseValue = payload.readUInt32BE();
+            break;
+          case 'string':
+            throw new Error('string datatype not handled properly TODO');
+          default:
+            throw new Error(`unhandled datatype: ${param.datatype}`);
+        }
+      } catch (error) {
+        this.settleActiveOperation(error as Error);
+        return;
       }
 
-      // For read operations, update the parameter value with scaling and precision
+      // Update the parameter value with scaling and precision
       if (typeof responseValue === 'number') {
-        responseValue *= this.activeParam.scale;
+        responseValue *= param.scale;
 
-        if (this.activeParam.precision !== '') {
+        if (param.precision !== '') {
           responseValue = round(
             responseValue,
-            Number(this.activeParam.precision)
+            Number(param.precision)
           );
         }
       }
 
-      // Update the parameter value and timestamp
-      this.activeParam.value = responseValue;
-      this.activeParam.valuetimestamp = Date.now();
-      this.activeParam = undefined;
-    }
-    // Clear timeout
-    if (this.activeTimeout) {
-      clearTimeout(this.activeTimeout);
-      this.activeTimeout = undefined;
+      param.value = responseValue;
+      param.valuetimestamp = Date.now();
     }
 
-    if (this.activePromiseResolve) {
-      this.activePromiseResolve();
-    }
+    this.settleActiveOperation();
   }
 }
 

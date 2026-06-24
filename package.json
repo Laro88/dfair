@@ -15,7 +15,7 @@
     "watch": "tsc --watch",
     "clean": "rm -rf dist",
     "prepare": "npm run build",
-    "test": "npm run build && node test/smoke-test.js",
+    "test": "npm run build && node test/smoke-test.js && node --test --test-timeout=30000 test/polling.test.js",
     "debug": "node --inspect samples/demoapp_knownipnumber.js"
   },
   "repository": {

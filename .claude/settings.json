@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npm run build 2>&1)",
+      "PowerShell(pnpm run build 2>&1)",
+      "PowerShell(pnpm test 2>&1)"
+    ]
+  }
+}
